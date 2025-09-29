@@ -6,8 +6,8 @@ This repository provides a **minimal reproducible implementation** of our paper:
 > Submitted to **IEEE Transactions on Emerging Topics in Computing (TETC), 2025**.
 
 It contains:
-1. **Core modules**: Oh-Trust and HybridFS.  
-2. **Baselines**: ConSpot, ConFutures, Random.  
+1. **Core modules**: Oh-Trust.  
+2. **Baselines**: ConSpot, ConFutures, Random, and HybridFS.  
 3. **Data preprocessing** scripts for the Chicago Taxi dataset.  
 
 ---
