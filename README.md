@@ -12,8 +12,8 @@ This repository provides the **official minimal reproducible implementation** of
 ```
 .
 ├── OhTrust.py          # Main Oh-Trust orchestrator (BiN_CDO + BiN_TCD + SRU_ConR + DDQN)
-├── BiN_CDO.py          # Futures trading (ConFutures baseline, contract optimization)
-├── BiN_TCD.py          # Spot trading (ConSpot baseline)
+├── BiN_CDO.py          # Futures trading 
+├── BiN_TCD.py          # Spot trading 
 ├── SRU_ConR.py         # Reputation update + reward function + DDQN agent
 ├── ConFutures.py       # Pure Futures baseline
 ├── ConSpot.py          # Pure Spot baseline
@@ -146,7 +146,7 @@ If you use this code, please cite:
 ```
 @article{Qi2025OhTrust,
   title={Oh-Trust: Overbooking and Hybrid Trading Empowered Resource Scheduling with Smart Reputation Update over Dynamic Edge Networks},
-  author={Houyi Qi and ...},
+  author={Houyi Qi, Minghui Liwang,	Liqun Fu, Xianbin Wang, Huaiyu Dai, and Xiaoyu Xia},
   journal={IEEE Transactions on Emerging Topics in Computing},
   year={2025},
   note={under review}
