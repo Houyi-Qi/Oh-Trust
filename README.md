@@ -119,10 +119,10 @@ Example output:
 ```json
 {
   "method": "XXXXX",
-  "ESP_Utility": XXXXX,
-  "MU_Utility": XXXXX,
-  "FinishTaskNum": XXXX,
-  "NI": XXXX
+  "ESP_Utility": 1111,
+  "MU_Utility": 2222,
+  "FinishTaskNum": 3333,
+  "NI": 4444
 }
 ```
 
