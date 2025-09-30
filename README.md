@@ -126,7 +126,7 @@ Example output:
 }
 ```
 
-Additional metrics (e.g., PTCT, reputation, task finish rate) are available in code but not included in default outputs.
+Additional metrics (e.g., VoRM, TRLC, UoR) are available in code but not included in default outputs.
 
 ---
 
