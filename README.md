@@ -144,15 +144,14 @@ Additional metrics (e.g., VoRM, TRLC, UoR) are available in code but not include
 If you use this code, please cite:
 
 ```
-@misc{Qi2025OhTrust,
-  title={Oh-Trust: Overbooking and Hybrid Trading Empowered Resource Scheduling with Smart Reputation Update over Dynamic Edge Networks},
-  author={Houyi Qi and Minghui Liwang and	Liqun Fu and Xianbin Wang and Huaiyu Dai and Xiaoyu Xia},
+@misc{qi2025ohtrustoverbookinghybridtradingempowered,
+      title={Oh-Trust: Overbooking and Hybrid Trading-empowered Resource Scheduling with Smart Reputation Update over Dynamic Edge Networks}, 
+      author={Houyi Qi and Minghui Liwang and Liqun Fu and Xianbin Wang and Huaiyu Dai and Xiaoyu Xia},
       year={2025},
-      eprint={2509.08118},
+      eprint={2509.25683},
       archivePrefix={arXiv},
-      primaryClass={cs.DC},
-      url={https://arxiv.org/abs/2509.08118}, 
+      primaryClass={cs.NI},
+      url={https://arxiv.org/abs/2509.25683}, 
 }
-
 
 ```
