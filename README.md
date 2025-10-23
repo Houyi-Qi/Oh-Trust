@@ -3,7 +3,7 @@
 This repository provides the **official minimal reproducible implementation** of our paper:
 
 > *Oh-Trust: Overbooking and Hybrid Trading Empowered Resource Scheduling with Smart Reputation Update over Dynamic Edge Networks*  
-> Submitted to **IEEE Transactions on Emerging Topics in Computing (TETC), 2025** (under review).
+>**IEEE Transactions on Emerging Topics in Computing (TETC), 2025**, DOI:10.1109/TETC.2025.3625379.
 
 ---
 
@@ -144,14 +144,13 @@ Additional metrics (e.g., VoRM, TRLC, UoR) are available in code but not include
 If you use this code, please cite:
 
 ```
-@misc{qi2025ohtrustoverbookinghybridtradingempowered,
-      title={Oh-Trust: Overbooking and Hybrid Trading-empowered Resource Scheduling with Smart Reputation Update over Dynamic Edge Networks}, 
-      author={Houyi Qi and Minghui Liwang and Liqun Fu and Xianbin Wang and Huaiyu Dai and Xiaoyu Xia},
-      year={2025},
-      eprint={2509.25683},
-      archivePrefix={arXiv},
-      primaryClass={cs.NI},
-      url={https://arxiv.org/abs/2509.25683}, 
+@article{qi2025ohtrust,
+  title={Oh-Trust: Overbooking and Hybrid Trading Empowered Resource Scheduling with Smart Reputation Update over Dynamic Edge Networks},
+  author={Qi, Houyi and Liwang, Minghui and Fu, Liqun and Wang, Xianbin and Dai, Huaiyu and Xia, Xiaoyu},
+  journal={IEEE Transactions on Emerging Topics in Computing},
+  year={2025},
+  doi={10.1109/TETC.2025.3625379}
 }
+
 
 ```
