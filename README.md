@@ -145,12 +145,16 @@ If you use this code, please cite:
 
 ```
 @article{qi2025ohtrust,
-  title={Oh-Trust: Overbooking and Hybrid Trading Empowered Resource Scheduling with Smart Reputation Update over Dynamic Edge Networks},
   author={Qi, Houyi and Liwang, Minghui and Fu, Liqun and Wang, Xianbin and Dai, Huaiyu and Xia, Xiaoyu},
-  journal={IEEE Transactions on Emerging Topics in Computing},
+  journal={IEEE Transactions on Emerging Topics in Computing}, 
+  title={Oh-Trust: Overbooking and Hybrid Trading-Empowered Resource Scheduling With Smart Reputation Update Over Dynamic Edge Networks}, 
   year={2025},
+  volume={13},
+  number={4},
+  pages={1553-1564},
   doi={10.1109/TETC.2025.3625379}
 }
+
 
 
 ```
