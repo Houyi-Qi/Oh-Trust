@@ -117,7 +117,7 @@ Results are saved to `results/compare.json` by default; use `--output` to change
 - The implementation provides unified settlement, probability estimation, and contract renewal procedures. It supports synthetic demonstrations and reproducible comparisons under shared demand traces.
 - Risks use historical samples. Task-level settlement separates buyer default penalties from volunteer compensation. These adapt the paper's mechanisms; large contract spaces use a heuristic search.
 - Defaults are `tau = 0.1` and `0.3` for all three risk thresholds. Synthetic capacity, valuations, and other demo parameters do not represent the paper's experimental configuration.
-- This release supports checking core mechanisms; it does not reproduce all paper figures or establish a performance advantage.
+- This release supports checking core mechanisms.
 
 ---
 
