@@ -1,141 +1,124 @@
-# Oh-Trust: Overbooking and Hybrid Trading Empowered Resource Scheduling with Smart Reputation Update
+# Oh-Trust: Overbooking and Hybrid Trading-Empowered Resource Scheduling with Smart Reputation Update
 
-This repository provides the **official minimal reproducible implementation** of our paper:
+This repository provides a **minimal reproducible implementation** of our paper:
 
-> *Oh-Trust: Overbooking and Hybrid Trading Empowered Resource Scheduling with Smart Reputation Update over Dynamic Edge Networks*  
->**IEEE Transactions on Emerging Topics in Computing (TETC), 2025**, DOI:10.1109/TETC.2025.3625379.
+> *Oh-Trust: Overbooking and Hybrid Trading-Empowered Resource Scheduling With Smart Reputation Update Over Dynamic Edge Networks*
+>
+> **IEEE Transactions on Emerging Topics in Computing (TETC), 2025**
+>
+> DOI: [10.1109/TETC.2025.3625379](https://doi.org/10.1109/TETC.2025.3625379)
 
 ---
 
 ## 📂 Project Structure
 
-```
+~~~text
 .
-├── OhTrust.py          # Main Oh-Trust orchestrator (BiN_CDO + BiN_TCD + SRU_ConR + DDQN)
-├── BiN_CDO.py          # Futures trading 
-├── BiN_TCD.py          # Spot trading 
-├── SRU_ConR.py         # Reputation update + reward function + DDQN agent
-├── ConFutures.py       # Pure Futures baseline
-├── ConSpot.py          # Pure Spot baseline
-├── HybridFS.py         # Hybrid Futures+Spot baseline
+├── OhTrust.py          # Main workflow, training, and comparisons
+├── BiN_CDO.py          # Futures contract design
+├── BiN_TCD.py          # Contract execution and spot trading
+├── SRU_ConR.py         # Reputation, reward function, and DDQN
+├── ConFutures.py       # Pure futures baseline
+├── ConSpot.py          # Pure spot baseline
+├── HybridFS.py         # Hybrid futures and spot baseline
 ├── Random.py           # Random allocation baseline
-├── Utility.py          # Utility functions consistent with paper equations
-├── Pr.py               # Probability-related calculations (α, β, φ)
-└── README.md           # Project documentation (this file)
-```
+├── Utility.py          # Settlement, utility, and risk calculations
+├── Pr.py               # Demand scenarios and probability calculations
+├── data_utils.py       # Data generation and preprocessing
+├── requirements.txt    # Dependencies
+└── README.md           # Project documentation
+~~~
 
 ---
 
 ## 🔑 Core Modules
 
-1. **BiN_CDO** (Contract-based Futures Trading)  
-   - Implements candidate generation, best contract selection, and execution under demand uncertainty.  
-   - Aligns with the *ConFutures baseline*.  
+1. **BiN_CDO: Futures Contract Design**
+   Evaluates contracts using historical demand and selects feasible candidates under price, risk, and overbooking constraints.
 
-2. **BiN_TCD** (Task-based Spot Trading)  
-   - Implements spot-stage settlement and ConSpot baseline.  
+2. **BiN_TCD: Execution and Spot Trading**
+   Executes futures contracts, handles buyer defaults and volunteer compensation, and uses remaining capacity to serve unmet demand.
 
-3. **SRU_ConR** (Smart Reputation Update & Reward)  
-   - Execution-driven reputation monitoring after each long-term contract.  
-   - Provides reward function consistent with the paper.  
-   - Includes **DDQN agent** implementation.  
+3. **SRU_ConR: Reputation and Renewal**
+   Updates reputation from completed trades and uses Double DQN to choose between execution and renewal.
 
-4. **OhTrust**  
-   - Integrates BiN_CDO, BiN_TCD, and SRU_ConR.  
-   - Defines environment states `[demand, total_utility, NI, reputation]`.  
-   - Supports actions:  
-     - `0 = Renew` (renegotiate contract)  
-     - `1 = Execute` (futures + spot execution)  
-   - Trains an agent via **DDQN** and saves the best model.  
+4. **OhTrust: Integrated Workflow**
+   Combines these modules with state `[demand, total_utility, NI, reputation]` and actions `0 = Renew` and `1 = Execute`. Renewal uses observed history only and does not consume a trading slot.
 
 ---
 
 ## ⚙️ Requirements
 
-- Python **3.9+**  
-- Install dependencies:  
-  ```bash
-  pip install -r requirements.txt
-  ```  
+- Python **3.10+**; CPU execution is supported.
+- Main dependencies: NumPy, SciPy, pandas, PyTorch, and pytest.
 
-Dependencies:
-- numpy>=1.21  
-- pandas>=1.3  
-- tqdm>=4.62  
-- matplotlib>=3.4 (optional, for plotting)  
-- scipy>=1.7  
+~~~bash
+python -m pip install -r requirements.txt
+~~~
 
 ---
 
 ## 📊 Dataset
 
-We use the **Chicago Taxi dataset (2013–2016)**, available from the  
-[Chicago Data Portal](https://data.cityofchicago.org/Transportation/Taxi-Trips/wrvz-psew).  
+The paper uses **Chicago Taxi Trips (2013–2016)**, available from the [Chicago Data Portal](https://data.cityofchicago.org/Transportation/Taxi-Trips/wrvz-psew).
 
-From the raw CSV, we extract:
-- **Taxi ID**  
-- **Trip Start Timestamp**  
-- **Pickup Community Area**  
+Preprocessing reads `Taxi ID`, `Trip Start Timestamp`, and `Pickup Community Area`, filters community area **77**, and counts daily trips by taxi. Historical windows estimate demand bounds while excluding the current trade.
 
-Then filter **Community Area 77**, and group by `(TaxiID, Date)` to count daily trips (**NumTrips**).  
-Rolling statistics over 30 days provide historical demand bounds \(\hat{n}_i\) and \(\tilde{n}_i\).  
+By default, the code uses synthetic demand with a fixed random seed, requiring no dataset download. Local CSV input is supported through `--csv`.
 
 ---
 
 ## 🚀 Usage
 
-### Run Oh-Trust training
-```bash
+### Run Oh-Trust
+
+~~~bash
 python OhTrust.py
-```
+~~~
 
-This will:
-- Train DDQN agent on the Oh-Trust environment.  
-- Save the best model to:
-  ```
-  ohtrust_ddqn_best.pt
-  ```
+Trains DDQN, selects a model using validation returns, and evaluates it on a separate test trajectory. The default checkpoint is `ohtrust_ddqn_best.pt`.
 
-### Run baselines
-```bash
+### Run Baselines
+
+~~~bash
 python Random.py
 python ConFutures.py
 python ConSpot.py
 python HybridFS.py
-```
+~~~
+
+### Compare All Methods on the Same Demand Trajectory
+
+~~~bash
+python OhTrust.py --compare --seed 7 --slots 12 --episodes 3
+~~~
+
+To use a local raw taxi dataset:
+
+~~~bash
+python OhTrust.py --compare --csv taxi.csv --raw-taxi --num-fb 3 --warmup 30
+~~~
 
 ---
 
 ## 📈 Output
 
-Each run reports **four main indicators**:
+- `ESP_Utility`: Realized server utility.
+- `MU_Utility`: Realized buyer utility.
+- `FinishTaskNum`: Tasks actually completed through futures and spot trading.
+- `NI`: Offline contract search and online spot negotiation counts.
 
-- `ESP_Utility`  
-- `MU_Utility`  
-- `FinishTaskNum`  
-- `NI`  
-
-Example output:
-```json
-{
-  "method": "XXXXX",
-  "ESP_Utility": 1111,
-  "MU_Utility": 2222,
-  "FinishTaskNum": 3333,
-  "NI": 4444
-}
-```
-
-Additional metrics (e.g., VoRM, TRLC, UoR) are available in code but not included in default outputs.
+Results are saved to `results/compare.json` by default; use `--output` to change the path. Outputs also include defaults, volunteer compensation, renewals, and settlement details. NI is an implementation-level proxy for negotiation overhead.
 
 ---
 
 ## 📝 Notes
 
-- **α (Pr_alpha)**: For minimal reproducibility, α is simplified here. In practice, α should be **data-driven**, estimated from empirical demand distributions. An extension interface is provided in `Pr.py`.  
-- Reputation is updated **after each futures contract execution**, consistent with SRU_ConR.  
-- Outputs are aligned with paper definitions: ESP utility, MU utility, finished tasks, and NI count.  
-- This repository only releases **core modules and baselines** for peer review reproducibility.  
+- Updates unify settlement and probability estimation, fix residual demand allocation, history leakage, and DDQN renewal, and give all baselines the same demand traces and metrics.
+- Risks use historical samples. Task-level settlement separates buyer default penalties from volunteer compensation. These adapt the paper's mechanisms; large contract spaces use a heuristic search.
+- Defaults are `tau = 0.1` and `0.3` for all three risk thresholds. Synthetic capacity, valuations, and other demo parameters do not represent the paper's experimental configuration.
+- Original filenames and command-line entry points are retained. Some internal APIs now require explicit demand, capacity, or related inputs.
+- This release supports checking core mechanisms; it does not reproduce all paper figures or establish a performance advantage.
 
 ---
 
@@ -143,18 +126,15 @@ Additional metrics (e.g., VoRM, TRLC, UoR) are available in code but not include
 
 If you use this code, please cite:
 
-```
+~~~bibtex
 @article{qi2025ohtrust,
   author={Qi, Houyi and Liwang, Minghui and Fu, Liqun and Wang, Xianbin and Dai, Huaiyu and Xia, Xiaoyu},
-  journal={IEEE Transactions on Emerging Topics in Computing}, 
-  title={Oh-Trust: Overbooking and Hybrid Trading-Empowered Resource Scheduling With Smart Reputation Update Over Dynamic Edge Networks}, 
+  journal={IEEE Transactions on Emerging Topics in Computing},
+  title={Oh-Trust: Overbooking and Hybrid Trading-Empowered Resource Scheduling With Smart Reputation Update Over Dynamic Edge Networks},
   year={2025},
   volume={13},
   number={4},
   pages={1553-1564},
   doi={10.1109/TETC.2025.3625379}
 }
-
-
-
-```
+~~~

@@ -1,92 +1,66 @@
-# BiN_TCD.py
-# ----------------------------------------------------
-# BiN_TCD: Spot trading (ConSpot) for Oh-Trust
-# - Scans candidate payments from payment_max down to payment_min
-# - Under a global resource constraint (Num_RB), selects the price and
-#   allocation that maximize ESP's utility
-# ----------------------------------------------------
-"""
-BiN_TCD: Spot Trading Mechanism (ConSpot)
------------------------------------------
-Implements the ConSpot baseline for Oh-Trust:
-  • Iterates payment price from high → low
-  • For each price, computes desired allocations based on user valuations
-  • Checks feasibility under ESP’s remaining resource capacity (Num_RB)
-  • Computes ESP and MU utilities, selecting the best outcome
-
-Returns a tuple:
-  (ESP_Utility, MU_Utility, NI, FinishTaskNum)
-"""
-
-from __future__ import annotations
-from typing import Sequence, Tuple
+"""Algorithm 2 adaptation: futures first, then residual FB and arrived OB demand."""
 import numpy as np
+from Utility import (counts, values_array, capacity_value, nonnegative,
+                         execute_futures, settle_spot, combine_market)
+from BiN_CDO import finite_grid
 
 
-def conspot(
-    value: Sequence[float],
-    NumTask: Sequence[int],
-    cost: float,
-    payment_min: float,
-    payment_max: float,
-    Num_RB: int,
-) -> Tuple[float, float, int, int]:
-    """
-    End-to-end ConSpot spot trading.
+def allocate_at_price(values, demand, price, capacity, *, order=None):
+    d = counts(demand, "demand")
+    v = values_array(values, len(d))
+    remaining = capacity_value(capacity)
+    allocation = np.zeros_like(d)
+    if order is None:
+        order = np.argsort(-v, kind="stable")
+    for i in order:
+        if v[i] >= price:
+            allocation[i] = min(int(d[i]), remaining)
+            remaining -= int(allocation[i])
+    return allocation
 
-    Args:
-        value (Sequence[float]): Per-task valuation of each MU (length = Num_MU).
-        NumTask (Sequence[int]): Maximum number of tasks per MU (length = Num_MU).
-        cost (float): ESP's per-task cost.
-        payment_min (float): Minimum payment price to consider.
-        payment_max (float): Maximum payment price to consider.
-        Num_RB (int): ESP's available resource blocks (capacity).
 
-    Returns:
-        Tuple[float, float, int, int]:
-            ESP_Utility   (float): ESP's maximum achieved utility.
-            MU_Utility    (float): MUs' total achieved utility.
-            NI            (int): Number of interactions (for complexity accounting).
-            FinishTaskNum (int): Total number of tasks completed under optimal price.
-    """
-    v = np.asarray(value, dtype=float)
-    n = np.asarray(NumTask, dtype=int)
-    Num_MU = v.shape[0]
-    NI = 0
+def clear_spot(values, residual_demand, cost, capacity, prices):
+    d = counts(residual_demand, "residual demand")
+    v = values_array(values, len(d))
+    cap, c = capacity_value(capacity), nonnegative(cost, "cost")
+    best = settle_spot(np.zeros_like(d), d, v, 0.0, c, cap)
+    ni = 0
+    if cap > 0 and d.sum() > 0:
+        for p in sorted(set(prices), reverse=True):
+            nonnegative(p, "spot price")
+            if p < c:
+                continue
+            ni += int(np.count_nonzero(d)) + 1
+            a = allocate_at_price(v, d, p, cap)
+            out = settle_spot(a, d, v, p, c, cap)
+            if (out["seller_utility"], out["FinishTaskNum"]) > (best["seller_utility"], best["FinishTaskNum"]):
+                best = out
+    best["NI_online"] = ni
+    return best
 
-    ESP_best = 0.0
-    MU_best = 0.0
-    Fin_best = 0
 
-    # Scan price grid from high → low
-    p = float(payment_max)
-    while p >= payment_min:
-        desired = np.where(v >= p, n, 0)  # tasks MUs want at this price
-        NI += (Num_MU + 1)
+def execute_market(contract, demand, values, num_fb, capacity, cost, spot_prices, *,
+                   seed=0, spot_enabled=True, spot_limits=()):
+    d = counts(demand, "demand")
+    v = values_array(values, len(d))
+    if not 0 <= num_fb <= len(d) or len(contract.quantities) != num_fb:
+        raise ValueError("FB identities must match the contract")
+    futures = execute_futures(contract, d[:num_fb], v[:num_fb], capacity, cost, seed=seed)
+    remaining = capacity_value(capacity) - futures["FinishTaskNum"]
+    residual = d.copy()
+    residual[:num_fb] -= futures["allocation"]
+    if len(spot_limits):
+        limits = counts(spot_limits, "spot limits")
+        if limits.shape != residual.shape:
+            raise ValueError("spot limits must match buyer identities")
+        residual = np.minimum(residual, limits)
+    # Volunteers occur only when remaining == 0; they cannot be resold service.
+    spot = clear_spot(v, residual, cost, remaining, spot_prices if spot_enabled else ())
+    return combine_market(d, v, capacity, cost, futures, spot, num_fb, NI_online=spot["NI_online"])
 
-        total = int(np.sum(desired))
-        if p > cost and total <= Num_RB:
-            # Feasible: allocate all desired tasks
-            esp = total * (p - cost)
-            if esp > ESP_best:
-                ESP_best = esp
-                MU_best = float(np.sum(desired * (v - p)))
-                Fin_best = total
-        elif p > cost and total > Num_RB:
-            # Over-demand: allocate only top (v_i - p) tasks
-            per_utils = []
-            for i in range(Num_MU):
-                if desired[i] > 0:
-                    per_utils.extend([v[i] - p] * int(desired[i]))
-            per_utils.sort(reverse=True)
-            per_utils = per_utils[:Num_RB]
-            esp = Num_RB * (p - cost)
-            mu = float(np.sum(per_utils))
-            if esp > ESP_best:
-                ESP_best = esp
-                MU_best = mu
-                Fin_best = int(Num_RB)
 
-        p -= 1.0  # decrease price step by 1
-
-    return float(ESP_best), float(MU_best), int(NI), int(Fin_best)
+def conspot(value, NumTask, cost, payment_min, payment_max, Num_RB):
+    """Compatibility tuple: seller utility, buyer utility, NI, completed tasks."""
+    out = clear_spot(value, NumTask, cost, Num_RB, finite_grid(payment_min, payment_max))
+    return (out["seller_utility"], float(out["buyer_utility"].sum()),
+            out["NI_online"], out["FinishTaskNum"])

@@ -1,406 +1,376 @@
-# Oh-Trust.py
-# ----------------------------------------------------
-# Oh-Trust main runner:
-# - State: 4D [demand, total_utility, NI, reputation]
-# - Actions: 0 = Renew (pick new futures contract)
-#            1 = Execute (futures execution + spot top-up)
-# - Reward: SRU_ConR.reward() (consistent with the paper)
-# - Training: DDQN; best model saved as ohtrust_ddqn_best.pt
-# ----------------------------------------------------
-
-from __future__ import annotations
-from typing import Tuple, Dict, Any, Optional
+"""Causal Execute/Renew environment and held-out-validation DDQN training."""
+from dataclasses import dataclass, field, asdict, replace
+import argparse
+import json
+from pathlib import Path
+import copy
 import numpy as np
+import BiN_CDO as CDO
+import BiN_TCD as TCD
+import SRU_ConR as SRU
+from data_utils import synthetic_trace, load_trace_csv, DemandTrace
+from Utility import (Contract, counts, values_array, execute_futures, combine_market,
+                     capacity_value, nonnegative, summarize_records, to_builtin)
+from Random import random_spot
 
-import BiN_CDO as CDO           # Futures trading (candidate search, execution w/ demand)
-import BiN_TCD as TCD           # Spot trading (ConSpot)
-import SRU_ConR as SRU          # Reputation, reward, and DDQN agent
+
+@dataclass(frozen=True)
+class MarketConfig:
+    capacity: int = 10                 # SYNTHETIC stress setting, not paper G=600
+    cost: float = 2.0
+    design: CDO.DesignConfig = field(default_factory=CDO.DesignConfig)
+    spot_prices: tuple = (3.0, 4.0, 5.0, 6.0, 7.0, 8.0)
+    history_window: int = 12
+    max_invalid_renewals: int = 2
+    w4: float = 1.0
+    w5: float = 1.0
+    omega6: float = 1e-3
+    omega7: float = 1.0
+    renew_reward: float = -10.0
+    spot_limits: tuple = ()
+
+    def __post_init__(self):
+        capacity_value(self.capacity)
+        nonnegative(self.cost, "cost")
+        if self.history_window < 1 or self.max_invalid_renewals < 1:
+            raise ValueError("positive history/renewal limits required")
+        for p in self.spot_prices:
+            nonnegative(p, "spot price")
+        counts(self.spot_limits, "spot_limits")
+        if self.renew_reward >= 0:
+            raise ValueError("Eq.22 requires a negative renewal reward")
 
 
 class OhTrustEnv:
-    """
-    Oh-Trust Environment
-    --------------------
-    A lightweight training environment that integrates:
-      - Futures design/selection via BiN_CDO
-      - Execution with realized demand & capacity limits
-      - Spot-stage top-up via BiN_TCD when capacity remains
-      - Reputation and reward calculation via SRU_ConR
+    """Four observed state values; only Execute advances the demand cursor."""
+    state_size, action_size = 4, 2
 
-    Observation/State vector (float32):
-        [ demand_total, total_utility_sum, NI, reputation ]
+    def __init__(self, trace=None, config=None, seed=0):
+        self.trace = trace if trace is not None else synthetic_trace(seed)
+        self.config = config or MarketConfig()
+        self.seed = seed
+        self._initialized = False
 
-    Action space:
-        0 -> Renew: re-pick the best futures contract (no execution)
-        1 -> Execute: run futures execution + spot top-up this step
+    def set_settings_tuple(self, settings, *, history=None, demands=None, horizon=100):
+        if self._initialized and not self.done:
+            raise RuntimeError("configure inputs before reset()")
+        (self.Num_FU, _, _, _, self.FU_TaskNum_min, self.FU_TaskNum_max, _,
+         self.cost_ESP, self.ESP_capability, _, _, self.value_FU_OneTask,
+         self.payment_Future_min, self.payment_Future_max, self.penalty_FU_min,
+         self.penalty_FU_max, self.penalty_ESP_min, self.penalty_ESP_max) = settings
+        rng = np.random.default_rng(self.seed)
+        shape = (self.config.history_window, self.Num_FU)
+        if history is None:
+            history = rng.integers(self.FU_TaskNum_min, self.FU_TaskNum_max + 1, size=shape)
+        if demands is None:
+            demands = rng.integers(self.FU_TaskNum_min, self.FU_TaskNum_max + 1, size=(horizon, self.Num_FU))
+        self.trace = DemandTrace(history, demands, self.value_FU_OneTask, self.Num_FU,
+                                 "settings tuple; synthetic defaults unless observations supplied")
+        design = replace(self.config.design,
+                         prices=CDO.finite_grid(self.payment_Future_min, self.payment_Future_max),
+                         buyer_fines=CDO.finite_grid(self.penalty_FU_min, self.penalty_FU_max),
+                         seller_compensations=CDO.finite_grid(self.penalty_ESP_min, self.penalty_ESP_max))
+        self.config = replace(self.config, capacity=self.ESP_capability, cost=self.cost_ESP,
+                              design=design, spot_prices=design.prices, spot_limits=())
+        self._initialized = False
 
-    Notes:
-        * This is a minimal training shell for reproducibility, not a full gym env.
-        * External APIs expected:
-            - CDO.generate_futures_candidates(...)
-            - CDO.select_best_futures_candidate(...)
-            - CDO.execute_with_demand(...)
-            - TCD.conspot(...)
-            - SRU.reputation(...), SRU.reward(...)
-            - SRU.DDQNAgent(...)
-    """
+    def set_spot_inputs(self, value_spot, NumTask_spot, payment_spot_min, payment_spot_max):
+        if self._initialized and not self.done:
+            raise RuntimeError("configure inputs before reset()")
+        if not np.array_equal(np.asarray(value_spot), self.trace.values):
+            raise ValueError("spot buyers must match trace identities; put OB demand in DemandTrace")
+        limits = counts(NumTask_spot, "spot request limits")
+        if len(limits) != len(self.trace.values):
+            raise ValueError("spot limits must match trace buyers")
+        self.config = replace(self.config, spot_prices=CDO.finite_grid(payment_spot_min, payment_spot_max),
+                              spot_limits=tuple(limits.tolist()))
 
-    def __init__(self):
-        # -------- Futures settings (will be populated via set_settings_tuple) --------
-        self.Num_FU: Optional[int] = None
-        self.FU_TaskNum_min: Optional[int] = None
-        self.FU_TaskNum_max: Optional[int] = None
-        self.cost_ESP: Optional[float] = None
-        self.ESP_capability: Optional[int] = None
-        self.value_FU_OneTask: Optional[np.ndarray] = None
-        self.payment_Future_min: Optional[float] = None
-        self.payment_Future_max: Optional[float] = None
-        self.penalty_FU_min: Optional[float] = None
-        self.penalty_FU_max: Optional[float] = None
-        self.penalty_ESP_min: Optional[float] = None
-        self.penalty_ESP_max: Optional[float] = None
+    def _pick_contract(self):
+        best = CDO.design_contract(self.trace.values[:self.trace.num_fb],
+                                   self.history[:, :self.trace.num_fb], self.config.capacity,
+                                   self.config.cost, config=self.config.design, seed=self.seed)
+        self.NI_offline += best["NI_offline"]
+        self.current_contract = best["contract"]
+        self.contract_design = best
+        self.contract_version = self.history_version
+        return best["NI_offline"]
 
-        # -------- Spot settings (optional; defaults to futures values if not set) --------
-        self.value_spot: Optional[np.ndarray] = None
-        self.NumTask_spot: Optional[np.ndarray] = None
-        self.payment_spot_min: Optional[float] = None
-        self.payment_spot_max: Optional[float] = None
+    def reset(self):
+        self.history = self.trace.history[-self.config.history_window:].copy()
+        self.t = self.history_version = self.contract_version = 0
+        self.NI_offline = self.NI_online = self.renewals = self.invalid_renewals = 0
+        self.records, self.events = [], []
+        self.episode_return = 0.0
+        self.done, self.truncated = False, False
+        ni = self._pick_contract()
+        self._state = np.array([self.history[:, :self.trace.num_fb].sum(axis=1).mean(),
+                                0.0, ni, 0.0], dtype=np.float32)
+        self._initialized = True
+        return self._state.copy()
 
-        # -------- RL config --------
-        self.state_size = 4
-        self.action_size = 2
-        self.max_steps = 100  # not enforced here; controlled by the trainer
+    def valid_actions(self):
+        if self.done:
+            return ()
+        return (0, 1) if self.history_version > self.contract_version else (1,)
 
-        # -------- Reputation/Reward hyper-parameters (consistent with paper) --------
-        self.Rew1 = -10.0          # base penalty when action = Renew
-        self.w4, self.w5 = 1.0, 1.0
-        self.omega6, self.omega7 = 1e-3, 1.0
+    def state_scale(self):
+        # Public resource constants and warmup history only; no test-demand fit.
+        cap = max(1, self.config.capacity)
+        value = max(1.0, float(np.max(self.trace.values, initial=0)))
+        return np.array([cap, cap * value, max(1, self.contract_design["NI_offline"]),
+                         max(1, cap * (1 + self.config.design.overbook_rate))], dtype=float)
 
-        # -------- Internal trackers --------
-        self.current_contract: Optional[Dict[str, Any]] = None
-        self._last_total_utility = 0.0
-        self._last_NI = 0
-        self._last_reputation = 0.0
-        self._last_demand = 0
-
-    # ---------------------------
-    # Configuration helpers
-    # ---------------------------
-    def set_settings_tuple(self, settings: Tuple):
-        """
-        Populate futures-related settings from a pre-packed tuple.
-        See demo_settings(...) for the tuple layout.
-        """
-        (self.Num_FU, _FU_comp, _FU_pow_local, _Num_OU_expected,
-         self.FU_TaskNum_min, self.FU_TaskNum_max, _FU_power_trans,
-         self.cost_ESP, self.ESP_capability, _V1, _V2, self.value_FU_OneTask,
-         self.payment_Future_min, self.payment_Future_max,
-         self.penalty_FU_min, self.penalty_FU_max,
-         self.penalty_ESP_min, self.penalty_ESP_max) = settings
-
-    def set_spot_inputs(self,
-                        value_spot,
-                        NumTask_spot,
-                        payment_spot_min: float,
-                        payment_spot_max: float) -> None:
-        """
-        Set spot-stage pool and price scan bounds.
-
-        Args:
-            value_spot: array-like of per-task valuations for spot candidates
-            NumTask_spot: array-like of max tasks per candidate
-            payment_spot_min/max: scan bounds for spot-stage uniform price
-        """
-        self.value_spot = np.asarray(value_spot, dtype=float)
-        self.NumTask_spot = np.asarray(NumTask_spot, dtype=int)
-        self.payment_spot_min = float(payment_spot_min)
-        self.payment_spot_max = float(payment_spot_max)
-
-    # ---------------------------
-    # Internal utilities
-    # ---------------------------
-    def _ensure(self) -> None:
-        """Validate that required settings are present; set spot defaults if absent."""
-        req = [self.Num_FU, self.FU_TaskNum_min, self.FU_TaskNum_max, self.cost_ESP,
-               self.ESP_capability, self.value_FU_OneTask, self.payment_Future_min,
-               self.payment_Future_max, self.penalty_FU_min, self.penalty_FU_max,
-               self.penalty_ESP_min, self.penalty_ESP_max]
-        if any(x is None for x in req):
-            raise RuntimeError("Settings incomplete. Call set_settings_tuple(...) first.")
-
-        if self.value_spot is None:
-            # Default: reuse futures valuations; one task per candidate
-            self.set_spot_inputs(
-                value_spot=self.value_FU_OneTask,
-                NumTask_spot=np.ones(int(self.Num_FU), dtype=int),
-                payment_spot_min=float(self.payment_Future_min),
-                payment_spot_max=float(self.payment_Future_max),
-            )
-
-    def _pick_contract(self) -> Optional[Dict[str, Any]]:
-        """
-        Run futures candidate search + selection once and cache NI.
-        Returns:
-            Best feasible contract dict or None.
-        """
-        cand, NI = CDO.generate_futures_candidates(
-            self.value_FU_OneTask,
-            self.payment_Future_min, self.payment_Future_max,
-            self.penalty_FU_min, self.penalty_FU_max,
-            self.penalty_ESP_min, self.penalty_ESP_max,
-            self.cost_ESP, self.ESP_capability,
-            self.FU_TaskNum_min, self.FU_TaskNum_max
-        )
-        best = CDO.select_best_futures_candidate(
-            cand, self.cost_ESP, self.ESP_capability, self.FU_TaskNum_min, self.FU_TaskNum_max
-        )
-        self._last_NI = int(NI)
-        return best if best.get("feasible", False) else None
-
-    # ---------------------------
-    # RL-style API
-    # ---------------------------
-    def reset(self) -> np.ndarray:
-        """Reset environment states and pick an initial contract."""
-        self._ensure()
-        self.current_contract = self._pick_contract()
-        self._last_total_utility = 0.0
-        self._last_NI = 0
-        self._last_reputation = 0.0
-        self._last_demand = 0
-        return np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-
-    def step(self, action: int):
-        """
-        Take one step in the environment.
-
-        Args:
-            action (int): 0 = Renew (re-pick contract),
-                          1 = Execute (futures exec + spot top-up)
-
-        Returns:
-            next_state (np.ndarray[float32, 4])
-            reward (float)
-            done (bool): always False in this minimal shell
-            info (dict): extra info (empty here)
-            esp (float): ESP utility obtained in this step (for logging)
-            mu  (float): MU utility obtained in this step (for logging)
-        """
-        self._ensure()
-
-        ESP_u = MU_u = 0.0
-        NI = 0
-        Rep = 0.0
-        demand_total = 0
-
+    def step(self, action):
+        if not self._initialized:
+            raise RuntimeError("call reset() first")
+        if self.done:
+            raise RuntimeError("episode already finished")
+        if action not in (0, 1):
+            raise ValueError("action must be Renew=0 or Execute=1")
+        info = dict(action=int(action), executed=False, transaction_index=self.t,
+                    FinishTaskNum=0, FinishTaskNum_futures=0, FinishTaskNum_spot=0,
+                    NI_offline=0, NI_online=0, NI=0, ESP_Utility=0.0, MU_Utility=0.0)
+        esp = mu = 0.0
         if action == 0:
-            # ---------- Renew: pick a new contract only ----------
-            self.current_contract = self._pick_contract()
-            NI = self._last_NI
-            reward = SRU.reward(
-                action=0, ESP_Utility=0.0, MU_Utility=0.0, Rep=0.0,
-                Rew1=self.Rew1, omega6=self.omega6, omega7=self.omega7
-            )
-
-        else:
-            # ---------- Execute: futures execution + spot top-up ----------
-            if self.current_contract is None:
-                self.current_contract = self._pick_contract()
-
-            if self.current_contract is not None:
-                p = float(self.current_contract["payment"])
-                q_f = float(self.current_contract["penalty_FU"])
-                contract = np.asarray(self.current_contract["FU_max_tasks"], dtype=int)
-
-                # Dynamic realized demand per FU (can be replaced by real traces)
-                actual_demand = np.random.randint(
-                    int(self.FU_TaskNum_min), int(self.FU_TaskNum_max) + 1, int(self.Num_FU)
-                )
-                demand_total = int(np.sum(actual_demand))
-
-                # Futures execution under capacity; returns (+/-) counts for reputation
-                ESP_f, MU_f, Fin_f, alloc_vec, Np, Nm = CDO.execute_with_demand(
-                    value=self.value_FU_OneTask,
-                    payment_fut=p,
-                    contract_numTask=contract,
-                    actual_demand=actual_demand,
-                    capacity_exec=int(self.ESP_capability),
-                    penalty_FU=q_f,
-                    cost=float(self.cost_ESP)
-                )
-
-                # Use remaining capacity in the spot stage (ConSpot)
-                remain = int(self.ESP_capability) - int(Fin_f)
-                if remain > 0:
-                    ESP_s, MU_s, NI_s, Fin_s = TCD.conspot(
-                        value=self.value_spot,
-                        NumTask=self.NumTask_spot,
-                        cost=float(self.cost_ESP),
-                        payment_min=float(self.payment_spot_min),
-                        payment_max=float(self.payment_spot_max),
-                        Num_RB=int(remain)
-                    )
-                else:
-                    ESP_s = MU_s = 0.0
-                    NI_s = 0
-                    Fin_s = 0
-
-                ESP_u = float(ESP_f + ESP_s)
-                MU_u = float(MU_f + MU_s)
-                NI = int(NI_s + (self.Num_FU + 1))  # keep style consistent
-
-                # Reputation & reward
-                Rep = SRU.reputation(N_plus=int(Np), N_minus=int(Nm), w4=self.w4, w5=self.w5)
-                reward = SRU.reward(
-                    action=1, ESP_Utility=ESP_u, MU_Utility=MU_u, Rep=Rep,
-                    Rew1=self.Rew1, omega6=self.omega6, omega7=self.omega7
-                )
+            if 0 not in self.valid_actions():
+                self.invalid_renewals += 1
+                info["renewal_blocked"] = "no new history since previous contract search"
+                if self.invalid_renewals >= self.config.max_invalid_renewals:
+                    self.done = self.truncated = True
             else:
-                # No feasible contract -> neutral reward this step
-                reward = 0.0
+                ni = self._pick_contract()
+                self.renewals += 1
+                self.invalid_renewals = 0
+                self._state[2] = ni
+                info.update(NI_offline=ni, NI=ni, contract_changed_at_history=self.history_version)
+            r = SRU.reward(0, 0, 0, 0, Rew1=self.config.renew_reward)
+        else:
+            # Sole future-trajectory read in the entire environment decision path.
+            demand = self.trace.demands[self.t]
+            trade_seed = np.random.SeedSequence([self.seed, self.t, 17])
+            trade = TCD.execute_market(self.current_contract, demand, self.trace.values,
+                                       self.trace.num_fb, self.config.capacity, self.config.cost,
+                                       self.config.spot_prices, seed=trade_seed,
+                                       spot_limits=self.config.spot_limits)
+            self.records.append(trade)
+            self.NI_online += trade["NI_online"]
+            rep = SRU.reputation(trade["N_plus"], trade["N_minus"], self.config.w4, self.config.w5)
+            esp, mu = trade["ESP_Utility"], trade["MU_Utility"]
+            # Eq.22 uses futures-side U_dot + U_tilde; spot utilities are reported separately.
+            r = SRU.reward(1, trade["futures_ESP_Utility"], trade["futures_MU_Utility"], rep,
+                           omega6=self.config.omega6, omega7=self.config.omega7)
+            self._state = np.array([np.sum(demand[:self.trace.num_fb]), esp + mu,
+                                    trade["NI_online"], rep], dtype=np.float32)
+            self.history = np.concatenate([self.history, np.asarray(demand)[None, :]])[-self.config.history_window:]
+            self.t += 1
+            self.history_version += 1
+            self.invalid_renewals = 0
+            self.done = self.t == len(self.trace.demands)
+            info.update(trade, executed=True, reputation=rep)
+        self.episode_return += r
+        info.update(history_version=self.history_version, contract_version=self.contract_version,
+                    contract=self.current_contract.quantities.copy(),
+                    price=self.current_contract.price, q_F=self.current_contract.q_F,
+                    q_E=self.current_contract.q_E, contract_feasible=self.contract_design["feasible"],
+                    terminated=self.done and not self.truncated, truncated=self.truncated,
+                    valid_actions=self.valid_actions(), NI_offline_total=self.NI_offline,
+                    NI_online_total=self.NI_online)
+        self.events.append(to_builtin(info))
+        return self._state.copy(), float(r), self.done, info, float(esp), float(mu)
 
-        # Update trackers & build next state
-        self._last_total_utility = ESP_u + MU_u
-        self._last_NI = int(NI)
-        self._last_reputation = float(Rep)
-        self._last_demand = int(demand_total)
-
-        next_state = np.array(
-            [self._last_demand, self._last_total_utility, self._last_NI, self._last_reputation],
-            dtype=np.float32
-        )
-        done = False
-        info: Dict[str, Any] = {}
-        return next_state, float(reward), bool(done), info, float(ESP_u), float(MU_u)
-
-
-# ----------------- Demo settings (replace with real data if needed) -----------------
-def demo_settings(Num_FU: int = 30) -> Tuple:
-    """
-    Generate synthetic demo settings for quick training sanity checks.
-    Returns:
-        A tuple matching the expected layout in set_settings_tuple(...).
-    """
-    FU_computer_local = (np.random.randint(10, 15, Num_FU) * 1e8) / 600
-    FU_power_trans = np.random.randint(500, 551, Num_FU) * 0.001
-    FU_power_local = np.random.randint(450, 501, Num_FU) * 0.001
-    ESP_computer_local = (1.5 * 1e12) / 600
-    ESP_power_local = 0.7
-    task_D = 1.5e6
-    Wb = 6e6
-    SNR_expected = 250
-
-    time_local = task_D / FU_computer_local
-    time_ESP = task_D / ESP_computer_local
-    time_trans = task_D / (Wb * np.log2(1 + FU_power_trans * SNR_expected))
-    time_save = time_local + time_trans - time_ESP
-    energy_save = time_local * FU_power_local - time_trans * FU_power_trans
-
-    V1 = 10.0
-    V2 = 10.0
-    value_FU_OneTask = V1 * time_save + V2 * energy_save
-    cost_hard = 0.001
-    cost_ESP = V2 * task_D * ESP_power_local / ESP_computer_local + cost_hard
-
-    payment_Future_max = float(np.max(value_FU_OneTask))
-    payment_Future_min = float(np.min(value_FU_OneTask))
-    penalty_FU_min, penalty_FU_max = 0.5, 3.0
-    penalty_ESP_min, penalty_ESP_max = 0.5, 5.0
-    FU_TaskNum_min, FU_TaskNum_max = 7, 12
-    ESP_capability = 600
-    Num_OU_expected = 20  # placeholder
-
-    return (
-        Num_FU, FU_computer_local, FU_power_local, Num_OU_expected,
-        FU_TaskNum_min, FU_TaskNum_max, FU_power_trans, cost_ESP,
-        ESP_capability, V1, V2, value_FU_OneTask,
-        payment_Future_min, payment_Future_max,
-        penalty_FU_min, penalty_FU_max, penalty_ESP_min, penalty_ESP_max
-    )
+    def summary(self):
+        out = summarize_records(self.records, self.NI_offline, "OhTrust", self.trace.digest)
+        out.update(renewals=self.renewals, episode_return=float(self.episode_return),
+                   terminated=self.done and not self.truncated, truncated=self.truncated)
+        return out
 
 
-# ----------------- Training main (save best model + JSON output) -----------------
-def train_and_save(
-    episodes: int = 5,
-    steps_per_episode: int = 100,
-    best_path: str = "ohtrust_ddqn_best.pt",
-) -> Dict[str, float]:
-    """
-    Train a DDQN agent on the Oh-Trust environment and save the best model.
+def run_episode(env, agent, *, training=False):
+    state = env.reset()
+    agent.set_training(training)
+    losses = []
+    while not env.done:
+        a = agent.act(state, evaluate=not training, valid_actions=env.valid_actions())
+        next_state, r, done, info, _, _ = env.step(a)
+        if training:
+            agent.remember(state, a, r, next_state, done, env.valid_actions())
+            loss = agent.replay()
+            if loss is not None:
+                losses.append(loss)
+        state = next_state
+    result = env.summary()
+    result["training_updates"] = len(losses)
+    return result
 
-    Args:
-        episodes (int): Number of episodes.
-        steps_per_episode (int): Steps per episode.
-        best_path (str): File path to save the best DDQN model.
 
-    Returns:
-        dict: Fixed-schema result of the best episode:
-            {
-                "method": "ohtrust",
-                "ESP_Utility": float,
-                "MU_Utility": float,
-                "FinishTaskNum": int,
-                "NI": int
-            }
-    """
-    env = OhTrustEnv()
-    env.set_settings_tuple(demo_settings(Num_FU=30))
-    env.set_spot_inputs(
-        value_spot=np.asarray(env.value_FU_OneTask, dtype=float),
-        NumTask_spot=np.ones(int(env.Num_FU), dtype=int),
-        payment_spot_min=float(env.payment_Future_min),
-        payment_spot_max=float(env.payment_Future_max),
-    )
+def train_agent(train_trace, validation_trace, config=None, *, episodes=3, seed=0,
+                best_path=None, batch_size=8):
+    """Select weights on validation return; no test trajectory is accepted here."""
+    if episodes < 1:
+        raise ValueError("at least one training episode is required")
+    if train_trace.digest == validation_trace.digest:
+        raise ValueError("training and validation trajectories must be independent")
+    if (train_trace.num_fb != validation_trace.num_fb
+            or not np.array_equal(train_trace.values, validation_trace.values)):
+        raise ValueError("training and validation must have the same buyer/resource schema")
+    cfg = config or MarketConfig()
+    train_env = OhTrustEnv(train_trace, cfg, seed)
+    train_env.reset()
+    agent = SRU.DDQNAgent(seed=seed, state_scale=train_env.state_scale(), batch_size=batch_size)
+    best_score, best_weights, best_episode = -np.inf, None, None
+    train_results, validation_results = [], []
+    for episode in range(episodes):
+        train_results.append(run_episode(train_env, agent, training=True))
+        validation = run_episode(OhTrustEnv(validation_trace, cfg, seed), agent, training=False)
+        validation_results.append(validation)
+        score = validation["episode_return"]
+        if score > best_score:
+            best_score, best_episode = score, episode + 1
+            best_weights = copy.deepcopy(agent.model.state_dict())
+    agent.model.load_state_dict(best_weights)
+    agent.update_target(tau=1.0)
+    agent.set_training(False)
+    if best_path is not None:
+        agent.save(best_path)
+    return agent, dict(selected_episode=best_episode, selection_metric="validation episode return",
+                       training=train_results, validation=validation_results,
+                       train_trajectory_hash=train_trace.digest, validation_trajectory_hash=validation_trace.digest,
+                       optimizer_updates=agent.updates, evaluation_exploration=False)
 
-    agent = SRU.DDQNAgent(state_size=env.state_size, action_size=env.action_size)
-    best_ret = -1e18
-    best_result: Dict[str, float] = {
-        "method": "ohtrust",
-        "ESP_Utility": 0.0,
-        "MU_Utility": 0.0,
-        "FinishTaskNum": 0,
-        "NI": 0,
-    }
 
-    for _ep in range(episodes):
-        s = env.reset()
-        ret = 0.0
-        ESP_total, MU_total, NI_total, Fin_total = 0.0, 0.0, 0, 0
+def train_and_save(episodes=3, steps_per_episode=12, best_path="ohtrust_ddqn_best.pt", *, seed=0):
+    traces = [synthetic_trace(seed + offset, slots=steps_per_episode) for offset in (0, 10000, 20000)]
+    agent, report = train_agent(traces[0], traces[1], episodes=episodes, seed=seed, best_path=best_path)
+    test = run_episode(OhTrustEnv(traces[2], seed=seed), agent)
+    return {"training_report": report, "held_out_test": test}
 
-        for _ in range(steps_per_episode):
-            a = agent.act(s)
-            s2, r, done, _info, esp, mu = env.step(a)
-            agent.remember(s, a, r, s2, done)
-            s = s2
 
-            # Aggregate stats
-            ret += float(r)
-            ESP_total += float(esp)
-            MU_total += float(mu)
-            NI_total += int(env._last_NI)
-            Fin_total += int(env._last_demand)
 
-            agent.replay()
-            if done:
-                break
+def demo_settings(Num_FU=30, *, seed=0):
+    rng = np.random.default_rng(seed)
+    local_rate = rng.integers(10, 15, Num_FU) * 1e8 / 600
+    transmit_power = rng.integers(500, 551, Num_FU) * 0.001
+    local_power = rng.integers(450, 501, Num_FU) * 0.001
+    server_rate, task_size = 1.5e12 / 600, 1.5e6
+    local_time = task_size / local_rate
+    transmit_time = task_size / (6e6 * np.log2(1 + transmit_power * 250))
+    time_saved = local_time - transmit_time - task_size / server_rate
+    energy_saved = local_time * local_power - transmit_time * transmit_power
+    values = 10 * time_saved + 10 * energy_saved
+    cost = 10 * task_size * 0.7 / server_rate + 0.001
+    return (Num_FU, local_rate, local_power, 20, 7, 12, transmit_power, cost, 600,
+            10., 10., values, float(values.min()), float(values.max()), 0.5, 3., 0.5, 5.)
 
-        agent.update_target()
 
-        if ret > best_ret:
-            best_ret = ret
-            agent.save(best_path)
-            best_result = {
-                "method": "OhTrust",
-                "ESP_Utility": float(ESP_total),
-                "MU_Utility": float(MU_total),
-                "FinishTaskNum": int(Fin_total),
-                "NI": int(NI_total),
-            }
+METHODS = ("OhTrust", "ConFutures", "HybridFS", "ConSpot", "Random")
 
-    # Print once for automated runners / CI logs
-    print(best_result)
-    return best_result
+
+def evaluate_static(method, trace, config, *, seed=0):
+    if method not in METHODS[1:]:
+        raise ValueError("unknown static method")
+    offline = 0
+    contract = Contract.empty(trace.num_fb)
+    design = None
+    if method in ("ConFutures", "HybridFS"):
+        design = CDO.design_contract(trace.values[:trace.num_fb],
+                                 trace.history[-config.history_window:, :trace.num_fb],
+                                 config.capacity, config.cost, config=config.design, seed=seed)
+        contract, offline = design["contract"], design["NI_offline"]
+    records = []
+    for t, demand in enumerate(trace.demands):
+        trial_seed = np.random.SeedSequence([seed, t, 17])
+        if method in ("ConFutures", "HybridFS"):
+            out = TCD.execute_market(contract, demand, trace.values, trace.num_fb, config.capacity,
+                                 config.cost, config.spot_prices, seed=trial_seed,
+                                 spot_enabled=(method == "HybridFS"), spot_limits=config.spot_limits)
+        else:
+            futures = execute_futures(contract, demand[:trace.num_fb], trace.values[:trace.num_fb],
+                                       config.capacity, config.cost, seed=trial_seed)
+            clearing = TCD.clear_spot if method == "ConSpot" else random_spot
+            kwargs = {"seed": np.random.SeedSequence([seed, t, 31])} if method == "Random" else {}
+            requests = np.minimum(demand, config.spot_limits) if config.spot_limits else demand
+            spot = clearing(trace.values, requests, config.cost, config.capacity, config.spot_prices, **kwargs)
+            out = combine_market(demand, trace.values, config.capacity, config.cost, futures, spot,
+                                 trace.num_fb, NI_online=spot["NI_online"])
+        records.append(out)
+    result = summarize_records(records, offline, method, trace.digest)
+    result.update(renewals=0, terminated=True, truncated=False)
+    if design is not None:
+        result["initial_contract"] = dict(quantities=contract.quantities.tolist(), price=contract.price,
+                                          q_F=contract.q_F, q_E=contract.q_E,
+                                          feasible=design["feasible"],
+                                          history_bounds=design["history_bounds"])
+    return result, records
+
+
+def compare(traces, config=None, *, seed=7, episodes=3, checkpoint=None, methods=METHODS):
+    cfg = config or MarketConfig()
+    if len({traces[name].digest for name in ("train", "validation", "test")}) != 3:
+        raise ValueError("train, validation and test must be distinct")
+    summaries, raw_records, policy_report = {}, {}, None
+    for method in methods:
+        if method == "OhTrust":
+            agent, policy_report = train_agent(traces["train"], traces["validation"], cfg,
+                                               episodes=episodes, seed=seed, best_path=checkpoint)
+            env = OhTrustEnv(traces["test"], cfg, seed)
+            result = run_episode(env, agent, training=False)
+            result["policy"] = "DDQN, validation-selected, epsilon=0 evaluation"
+            records = env.records
+            events = env.events
+        else:
+            result, records = evaluate_static(method, traces["test"], cfg, seed=seed)
+        summaries[method], raw_records[method] = result, records
+    shared = all(len(rows) == len(traces["test"].demands)
+                 and all(np.array_equal(row["demand"], traces["test"].demands[t])
+                         for t, row in enumerate(rows)) for rows in raw_records.values())
+    if not shared:
+        raise AssertionError("methods did not consume the identical demand trajectory")
+    return to_builtin(dict(scope="MINIMAL_SYNTHETIC_DEMO" if traces["test"].label.startswith("synthetic")
+                           else "LOCAL_DEMANDS_WITH_DEMO_VALUATIONS",
+                           scientific_evidence="SCIENTIFIC_EVIDENCE_INSUFFICIENT",
+                           seed=seed, config=asdict(cfg), shared_trajectory_verified=shared,
+                           traces={name: {"hash": tr.digest, "source": tr.label,
+                                           "transactions": len(tr.demands),
+                                           "warmup_rows": len(tr.history)} for name, tr in traces.items()},
+                           summaries=summaries, training=policy_report, records=raw_records,
+                           ohtrust_events=events if "OhTrust" in methods else [],
+                           validation_checks={"all_methods_share_test_trace": "PASS"}))
+
+
+def cli_main(default_method="OhTrust"):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--compare", action="store_true")
+    parser.add_argument("--model", default="ohtrust_ddqn_best.pt")
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--slots", type=int, default=12)
+    parser.add_argument("--episodes", type=int, default=3)
+    parser.add_argument("--samples", type=int, default=64)
+    parser.add_argument("--capacity", type=int, default=10, help="demo capacity, paper uses 600")
+    parser.add_argument("--output", default="results/compare.json")
+    parser.add_argument("--csv", help="local chronological Date + buyer demand columns")
+    parser.add_argument("--raw-taxi", action="store_true")
+    parser.add_argument("--warmup", type=int, default=30)
+    parser.add_argument("--history-window", type=int, help="past records used by each contract search")
+    parser.add_argument("--num-fb", type=int, default=3)
+    args = parser.parse_args()
+    if args.csv:
+        traces = load_trace_csv(args.csv, num_fb=args.num_fb, warmup=args.warmup, raw_taxi=args.raw_taxi)
+    else:
+        traces = {name: synthetic_trace(args.seed + offset, slots=args.slots, num_fb=args.num_fb)
+                  for name, offset in zip(("train", "validation", "test"), (0, 10000, 20000))}
+    window = args.history_window if args.history_window is not None else (args.warmup if args.csv else 12)
+    cfg = MarketConfig(capacity=args.capacity, history_window=window)
+    cfg = replace(cfg, design=replace(cfg.design, samples=args.samples))
+    path = Path(args.output)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    methods = METHODS if args.compare else (default_method,)
+    result = compare(traces, cfg, seed=args.seed, episodes=args.episodes,
+                     checkpoint=args.model, methods=methods)
+    path.write_text(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+    print(json.dumps(result["summaries"], indent=2, ensure_ascii=False, allow_nan=False))
+    print(f"Shared trajectory: PASS. Saved: {path}. Scientific performance: NOT_VALIDATED.")
+
 
 
 if __name__ == "__main__":
-    train_and_save()
+    cli_main()

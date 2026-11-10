@@ -1,252 +1,204 @@
-# BiN_CDO.py
-# ----------------------------------------------------
-# BiN_CDO: Futures trading (ConFutures) for Oh-Trust
-# - Candidate generation (payment, penalties, size K)
-# - Best candidate selection under overbooking
-# - Futures execution with actual demand + settlement
-#   (returns ESP/MU utilities and N+/N- for reputation)
-# ----------------------------------------------------
-"""
-BiN_CDO: Futures Trading Component for the Oh-Trust Framework
--------------------------------------------------------------
-This module provides the futures-side mechanics used by Oh-Trust:
-
-1) Candidate Generation
-   - Grid-search over payment and penalty parameters (payment, penalty_FU, penalty_ESP),
-     and scan a per-buyer contract size K from K_max down to K_min.
-   - For each buyer (FU), record the maximum acceptable K that passes a risk check
-     (based on expected utility).
-
-2) Best Candidate Selection
-   - Among generated candidates, select the feasible one (respecting overbooking)
-     that maximizes the ESP's expected utility.
-   - A candidate is feasible if the sum of per-buyer maxima does not exceed
-     (1 + OverbookRate) * ESP_capability.
-
-3) Futures Execution with Actual Demand
-   - Given realized per-buyer demand, greedily allocate up to the minimum of
-     (contracted, demand) under the capacity limit, by descending per-task margin
-     (v_i - payment_fut).
-   - Settle utilities and compute N_plus/N_minus for reputation updates.
-
-Notes
------
-- The code here focuses on clarity and reproducibility of the baseline; performance
-  optimizations are out of scope.
-"""
-
-from __future__ import annotations
-from typing import Sequence, Tuple, List, Dict, Any
-import numpy as np
+"""Finite contract offers with joint sample-risk screening."""
+from dataclasses import dataclass, field
+from itertools import product
 import math
-
-# Use your existing modules
+import numpy as np
 import Pr
-import Utility
+from Utility import RiskLimits, evaluate_contract
+from Utility import Contract, counts, capacity_value, nonnegative, values_array, execute_futures
 
 
-def risk_FU(expected_utility: float, threshold: float = 0.0) -> bool:
-    """Buyer-side risk check: accept if expected utility >= threshold."""
-    return expected_utility >= threshold
+def finite_grid(lo, hi, step=1.0):
+    lo, hi = nonnegative(lo, "lower bound"), nonnegative(hi, "upper bound")
+    if hi < lo or not np.isfinite(step) or step <= 0:
+        raise ValueError("invalid grid bounds/step")
+    grid = list(np.arange(lo, hi + 1e-10, step))
+    if not grid or grid[-1] < hi - 1e-9:
+        grid.append(hi)
+    return tuple(sorted(set(float(round(x, 10)) for x in grid), reverse=True))
 
 
-def generate_futures_candidates(
-    value_FU_OneTask: Sequence[float],
-    payment_min: float, payment_max: float,
-    penalty_FU_min: float, penalty_FU_max: float,
-    penalty_ESP_min: float, penalty_ESP_max: float,
-    cost_ESP: float, ESP_capability: int,
-    K_min: int, K_max: int,
-) -> Tuple[List[Dict[str, Any]], int]:
-    """
-    Generate futures candidates via grid search.
+@dataclass(frozen=True)
+class DesignConfig:
+    prices: tuple = (3.0, 4.0, 5.0, 6.0)
+    buyer_fines: tuple = (1.0, 2.0)
+    seller_compensations: tuple = (1.0, 2.0)
+    overbook_rate: float = 0.1
+    risks: RiskLimits = field(default_factory=RiskLimits)
+    samples: int = 64
+    max_joint_vectors: int = 20000
+    search_mode: str = "auto"
+    max_capacity_states: int = 10000
 
-    For each triple (payment, penalty_FU, penalty_ESP) and a contract size K
-    scanned from K_max down to K_min, evaluate each buyer's expected utility
-    and record the maximum acceptable K passing the risk constraint.
-
-    Args:
-        value_FU_OneTask: Per-buyer unit valuation (length = Num_FU).
-        payment_min/payment_max: Bounds for payment scanning (floored to ints).
-        penalty_FU_min/penalty_FU_max: Buyer-side penalty bounds (floored).
-        penalty_ESP_min/penalty_ESP_max: ESP-side penalty bounds (floored).
-        cost_ESP: ESP unit cost.
-        ESP_capability: ESP capacity (resource blocks).
-        K_min/K_max: Lower/upper bounds for per-buyer contract size.
-
-    Returns:
-        candidates: List of candidate dicts with keys:
-            {
-              "payment": float,
-              "penalty_FU": float,
-              "penalty_ESP": float,
-              "FU_max_tasks": np.ndarray[int] of shape (Num_FU,)
-            }
-        NI: Interaction count accumulated during evaluation (for logging parity).
-    """
-    v = np.asarray(value_FU_OneTask, dtype=float)
-    Num_FU = v.shape[0]
-
-    # Lower bound for payment scanning; follows the original code path
-    payment_lb = min(float(payment_min), float(cost_ESP))
-
-    candidates: List[Dict[str, Any]] = []
-    NI = 0
-
-    for p in range(int(math.floor(payment_max)), int(math.floor(payment_lb)) - 1, -1):
-        for q_f in range(int(math.floor(penalty_FU_max)), int(math.floor(penalty_FU_min)) - 1, -1):
-            for q_e in range(int(math.floor(penalty_ESP_max)), int(math.floor(penalty_ESP_min)) - 1, -1):
-
-                FU_max = np.zeros(Num_FU, dtype=int)
-
-                for K in range(int(K_max), int(K_min) - 1, -1):
-                    # Probability terms from Pr module
-                    Alpha = Pr.Pr_alpha(K_min, K_max, K)   # returns (A0, A1)
-                    Beta  = Pr.pr_beta_1(K_min, K_max, Num_FU, ESP_capability)
-                    Phi   = Pr.calculate_probabilities(K_min, K_max, Num_FU, ESP_capability)
-
-                    # Expected utility for each buyer under size K
-                    # (U_F_i_expected accepts scalar v_i; compute per buyer)
-                    for i in range(Num_FU):
-                        Uexp = Utility.U_F_i_expected(
-                            Alpha[0], Beta,
-                            K_min, K_max,
-                            float(v[i]),
-                            float(p),
-                            (payment_min + payment_max) / 2.0,
-                            float(q_f),
-                            Phi,
-                            float(q_e),
-                            int(K),
-                        )
-                        NI += (Num_FU + 1)
-                        if risk_FU(Uexp):
-                            FU_max[i] = max(FU_max[i], int(K))
-
-                candidates.append({
-                    "payment": float(p),
-                    "penalty_FU": float(q_f),
-                    "penalty_ESP": float(q_e),
-                    "FU_max_tasks": FU_max,
-                })
-
-    return candidates, NI
+    def __post_init__(self):
+        nonnegative(self.overbook_rate, "overbook_rate")
+        for name in ("prices", "buyer_fines", "seller_compensations"):
+            grid = tuple(sorted(set(nonnegative(x, name) for x in getattr(self, name)), reverse=True))
+            if not grid:
+                raise ValueError(f"{name} grid is empty")
+            object.__setattr__(self, name, grid)
+        if any(x < 1 or int(x) != x for x in (self.samples, self.max_joint_vectors, self.max_capacity_states)):
+            raise ValueError("samples and max_joint_vectors must be positive integers")
+        if self.search_mode not in ("auto", "exhaustive", "bounded"):
+            raise ValueError("search_mode must be auto, exhaustive or bounded")
 
 
-def select_best_futures_candidate(
-    candidates: List[Dict[str, Any]],
-    cost_ESP: float, ESP_capability: int,
-    K_min: int, K_max: int,
-    OverbookRate: float = 0.2,
-) -> Dict[str, Any]:
-    """
-    Select the feasible candidate that maximizes the ESP's expected utility.
+def risk_FU(risk_probability, threshold=0.3):
+    """Chance constraint, not a comparison between mean utility and probability."""
+    return 0 <= risk_probability <= threshold
 
-    Feasibility:
-        sum(FU_max_tasks) <= (1 + OverbookRate) * ESP_capability
 
-    Args:
-        candidates: Output of generate_futures_candidates().
-        cost_ESP: ESP unit cost.
-        ESP_capability: ESP capacity (resource blocks).
-        K_min/K_max: Bounds used in expectation computation.
-        OverbookRate: Allowed overbooking ratio (e.g., 0.2 => 120% capacity).
+def _bounded_vectors(values, scenarios, options, price, fine, cost, capacity, limit, risks):
+    score = np.full(limit + 1, -np.inf)
+    score[0] = 0.0
+    choices = np.zeros((len(values), limit + 1), dtype=int)
+    ni = 0
+    for i, quantities in enumerate(options):
+        updated = score.copy()
+        for n in quantities:
+            if n == 0:
+                continue
+            ni += 2
+            if values[i] < price:
+                continue
+            x = np.minimum(n, scenarios[:, i])
+            breach = np.maximum(n - scenarios[:, i], 0)
+            buyer_u = x * (values[i] - price) - breach * fine
+            if buyer_u.mean() < 0 or np.mean(buyer_u < risks.buyer_utility_min) > risks.rho1:
+                continue
+            # Additive proposals omit overload; the full joint ledger screens them below.
+            gain = float(np.mean(x * (price - cost) + breach * fine))
+            proposal = score[:-n] + gain
+            improve = proposal > updated[n:]
+            updated[n:][improve] = proposal[improve]
+            choices[i, n:][improve] = n
+        score = updated
+    budgets = sorted({min(limit, capacity), (min(limit, capacity) + limit) // 2, limit})
+    vectors, seen = [], set()
+    for budget in budgets:
+        weight = int(np.argmax(score[:budget + 1]))
+        n = np.zeros(len(values), dtype=int)
+        for i in range(len(values) - 1, -1, -1):
+            n[i] = choices[i, weight]
+            weight -= int(n[i])
+        key = tuple(n)
+        if n.sum() and key not in seen:
+            vectors.append(n)
+            seen.add(key)
+    return vectors, ni
 
-    Returns:
-        Best candidate dict with extra fields:
-            {
-              ...original candidate fields...,
-              "ESP_EUtility": float,
-              "feasible": True
-            }
-        If none feasible, returns {"feasible": False}.
-    """
-    best = {"feasible": False}
-    best_u = -np.inf
-    cap_allow = (1.0 + OverbookRate) * float(ESP_capability)
 
+def search_candidates(values, capacity, cost, lower, upper, *, history=None,
+                      scenarios=None, config=None, seed=0):
+    cfg = config or DesignConfig()
+    cap, cost = capacity_value(capacity), nonnegative(cost, "cost")
+    lo, hi = counts(lower, "lower contract bounds"), counts(upper, "upper contract bounds")
+    v = values_array(values, len(lo))
+    if lo.shape != hi.shape or np.any(lo > hi):
+        raise ValueError("invalid contract bounds")
+    if scenarios is None:
+        scenarios = Pr.sample_demand_scenarios(history=history, lower=lo, upper=hi,
+                                               samples=cfg.samples, seed=seed)
+    d = counts(scenarios, "scenarios", ndim=2)
+    if not len(d) or d.shape[1] != len(v):
+        raise ValueError("scenario dimensions do not match buyers")
+    priorities = np.random.default_rng(np.random.SeedSequence([seed, 991])).random(d.shape)
+    sample_id = Pr.scenario_digest(d, priorities)
+    limit = math.floor((1 + cfg.overbook_rate) * cap + 1e-9)
+    options = [list(range(min(int(b), limit), max(1, int(a)) - 1, -1)) + [0] for a, b in zip(lo, hi)]
+    count = math.prod(len(o) for o in options)
+    bounded = cfg.search_mode == "bounded" or (cfg.search_mode == "auto" and count > cfg.max_joint_vectors)
+    if count > cfg.max_joint_vectors and not bounded:
+        raise ValueError(f"joint grid has {count} vectors; limit {cfg.max_joint_vectors}. "
+                         "Use search_mode='auto' or 'bounded'.")
+    if bounded and limit + 1 > cfg.max_capacity_states:
+        raise ValueError("capacity exceeds max_capacity_states for bounded search")
+    exact_vectors = [] if bounded else [np.asarray(n, dtype=int) for n in product(*options) if 0 < sum(n) <= limit]
+    candidates, interactions = [], 0
+    for p, qf, qe in product(cfg.prices, cfg.buyer_fines, cfg.seller_compensations):
+        if p < cost:
+            continue
+        if bounded:
+            vectors, ni = _bounded_vectors(v, d, options, p, qf, cost, cap, limit, cfg.risks)
+            interactions += ni
+        else:
+            vectors = exact_vectors
+        for n in vectors:
+            active = n > 0
+            interactions += int(active.sum()) + 1  # proposal/reply proxy, not measured packets
+            if np.any(v[active] < p):
+                continue
+            contract = Contract(n, p, qf, qe)
+            risk = evaluate_contract(contract, d, v, cap, cost, priorities, cfg.risks)
+            buyer_ok = (np.all(risk["risk_buyer_utility"][active] <= cfg.risks.rho1)
+                        and np.all(risk["risk_volunteer"][active] <= cfg.risks.rho2)
+                        and np.all(risk["expected_buyer_utility"][active] >= 0))
+            if buyer_ok:
+                candidates.append(dict(payment=p, penalty_FU=qf, penalty_ESP=qe,
+                                       FU_max_tasks=n, contract=contract, risk=risk,
+                                       ESP_EUtility=risk["expected_seller_utility"],
+                                       seller_risk_limit=cfg.risks.rho3, sample_id=sample_id,
+                                       evaluation_capacity=cap, evaluation_cost=cost,
+                                       search_mode="bounded" if bounded else "exhaustive"))
+    return candidates, interactions
+
+
+def select_best_futures_candidate(candidates, cost_ESP, ESP_capability,
+                                 K_min=None, K_max=None, OverbookRate=0.1):
+    cap = capacity_value(ESP_capability)
+    limit = math.floor((1 + nonnegative(OverbookRate, "OverbookRate")) * cap + 1e-9)
+    feasible = []
     for cand in candidates:
-        total_max = int(np.sum(cand["FU_max_tasks"]))
-        if total_max <= cap_allow:
-            # Utility.U_ESP_Expected requires beta and phi
-            beta = Pr.pr_beta_1(K_min, K_max, total_max, ESP_capability)
-            phi  = Pr.calculate_probabilities(K_min, K_max, total_max, ESP_capability)
+        if cand.get("evaluation_capacity") != cap or cand.get("evaluation_cost") != cost_ESP:
+            raise ValueError("candidate evaluated with different resources; rebuild the scenarios")
+        if (cand["FU_max_tasks"].sum() <= limit
+                and cand["risk"]["risk_seller"] <= cand["seller_risk_limit"]
+                and cand["ESP_EUtility"] >= 0):
+            feasible.append(cand)
+    if not feasible:
+        return {"feasible": False, "reason": "No grid candidate satisfies all sample risk constraints"}
+    # First candidate breaks exact ties; grids and quantity order are deterministic.
+    return {**max(feasible, key=lambda c: c["ESP_EUtility"]), "feasible": True}
 
-            esp_u = Utility.U_ESP_Expected(
-                total_max,
-                int(K_min), int(K_max),
-                float(cand["payment"]), float(cost_ESP),
-                float(cand["penalty_FU"]), float(cand["penalty_ESP"]),
-                int(ESP_capability),
-                beta, phi,
-            )
-            if esp_u > best_u:
-                best_u = esp_u
-                best = {**cand, "ESP_EUtility": float(esp_u), "feasible": True}
+
+def design_contract(values, history, capacity, cost, *, config=None, seed=0):
+    cfg = config or DesignConfig()
+    h = counts(history, "history", ndim=2)
+    if not len(h):
+        raise ValueError("contract design requires pre-transaction history")
+    candidates, ni = search_candidates(values, capacity, cost, h.min(axis=0), h.max(axis=0),
+                                      history=h, config=cfg, seed=seed)
+    best = select_best_futures_candidate(candidates, cost, capacity, OverbookRate=cfg.overbook_rate)
+    best["NI_offline"] = ni
+    best["history_rows"] = len(h)
+    best["history_bounds"] = [h.min(axis=0).tolist(), h.max(axis=0).tolist()]
+    if not best["feasible"]:
+        best["contract"] = Contract.empty(h.shape[1])
     return best
 
 
-def execute_with_demand(
-    value: Sequence[float],
-    payment_fut: float,
-    contract_numTask: Sequence[int],
-    actual_demand: Sequence[int],
-    capacity_exec: int,
-    penalty_FU: float,
-    cost: float,
-) -> Tuple[float, float, int, np.ndarray, int, int]:
-    """
-    Execute futures with realized demand and settle utilities.
+def generate_futures_candidates(value_FU_OneTask, payment_min, payment_max,
+                                penalty_FU_min, penalty_FU_max, penalty_ESP_min, penalty_ESP_max,
+                                cost_ESP, ESP_capability, K_min, K_max, *,
+                                history=None, scenarios=None, seed=0, risks=None,
+                                OverbookRate=0.1, samples=64, search_mode="auto"):
+    size = len(value_FU_OneTask)
+    lo = np.broadcast_to(K_min, (size,))
+    hi = np.broadcast_to(K_max, (size,))
+    cfg = DesignConfig(finite_grid(payment_min, payment_max),
+                       finite_grid(penalty_FU_min, penalty_FU_max),
+                       finite_grid(penalty_ESP_min, penalty_ESP_max),
+                       OverbookRate, risks or RiskLimits(), samples, search_mode=search_mode)
+    return search_candidates(value_FU_OneTask, ESP_capability, cost_ESP, lo, hi,
+                             history=history, scenarios=scenarios, config=cfg, seed=seed)
 
-    Allocation rule:
-        - For each buyer i, potential deliverable = min(contract_i, demand_i).
-        - Build per-task margins (v_i - payment_fut) for these deliverables.
-        - Greedily allocate tasks by descending margin under capacity_exec.
 
-    Settlement:
-        - If delivered < contracted: FU pays penalty_FU per shortfall;
-          ESP receives the same penalty.
-        - Otherwise: utilities are computed on the contracted amount.
-
-    Returns:
-        (ESP_Utility, MU_Utility, FinishTaskNum, actual_alloc_vector, N_plus, N_minus)
-        where:
-          - FinishTaskNum = sum of actually delivered tasks across buyers
-          - N_plus: number of fulfilled contract tasks (for reputation)
-          - N_minus: number of defaulted contract tasks (for reputation)
-    """
-    v = np.asarray(value, dtype=float)
-    c = np.asarray(contract_numTask, dtype=int)
-    d = np.asarray(actual_demand, dtype=int)
-    Num_MU = v.shape[0]
-
-    per_task_util, idx = [], []
-    for i in range(Num_MU):
-        cap = int(min(c[i], d[i]))
-        if cap > 0:
-            per_task_util.extend([v[i] - payment_fut] * cap)
-            idx.extend([i] * cap)
-
-    alloc = np.zeros(Num_MU, dtype=int)
-    if per_task_util and capacity_exec > 0:
-        order = np.argsort(per_task_util)[::-1]
-        chosen = order[:min(capacity_exec, len(order))]
-        for k in chosen:
-            alloc[idx[k]] += 1
-
-    ESP_U, MU_U = 0.0, 0.0
-    N_plus, N_minus = 0, 0
-    for i in range(Num_MU):
-        delivered, contracted = int(alloc[i]), int(c[i])
-        fulfilled = min(delivered, contracted)
-        defaulted = max(contracted - delivered, 0)
-        N_plus += fulfilled
-        N_minus += defaulted
-        if delivered < contracted:
-            MU_U += delivered * (v[i] - payment_fut) - (contracted - delivered) * penalty_FU
-            ESP_U += delivered * (payment_fut - cost) + (contracted - delivered) * penalty_FU
-        else:
-            MU_U += contracted * (v[i] - payment_fut)
-            ESP_U += contracted * (payment_fut - cost)
-
-    return float(ESP_U), float(MU_U), int(np.sum(alloc)), alloc, int(N_plus), int(N_minus)
+def execute_with_demand(value, payment_fut, contract_numTask, actual_demand,
+                        capacity_exec, penalty_FU, cost, penalty_ESP=0.0, *,
+                        seed=0, return_details=False):
+    out = execute_futures(Contract(contract_numTask, payment_fut, penalty_FU, penalty_ESP),
+                          actual_demand, value, capacity_exec, cost, seed=seed)
+    if return_details:
+        return out
+    return (out["seller_utility"], float(out["buyer_utility"].sum()),
+            out["FinishTaskNum"], out["allocation"], out["N_plus"], out["N_minus"])

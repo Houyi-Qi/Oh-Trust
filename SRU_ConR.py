@@ -1,248 +1,141 @@
-# SRU_ConR.py
-# ----------------------------------------------------
-# SRU_ConR: Smart Reputation Update + Renew decision via DDQN
-# - reputation(): Rep = w4 * N_plus - w5 * N_minus
-# - reward():     paper-style reward for action {0: renew, 1: execute}
-# - DDQNAgent:    GPU-aware Double DQN for the renew decision
-# ----------------------------------------------------
-"""
-SRU_ConR: Reputation & RL Components for Oh-Trust
--------------------------------------------------
-This module provides:
-  1) A simple, execution-driven reputation function:
-       Rep = w4 * N_plus - w5 * N_minus
-  2) A paper-style reward function supporting two actions:
-       a=0 (renew):   r = Rew1    (typically negative)
-       a=1 (execute): r = omega6*(ESP_Utility + MU_Utility) + omega7*Rep
-  3) A minimal Double DQN (DDQN) agent used to decide whether to renew or execute.
-
-Notes
------
-- The DDQN implementation is intentionally lightweight for reproducibility.
-- If CUDA is available, tensors are moved to GPU automatically.
-"""
-
-from __future__ import annotations
-from typing import List, Dict, Any
+"""Paper Eqs.21/22 and the original 4 -> 64 -> 64 -> 2 Double DQN."""
+from collections import deque
+from pathlib import Path
+import random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import random
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# ------------- reputation & reward -------------
-def reputation(N_plus: int, N_minus: int, w4: float = 1.0, w5: float = 1.0) -> float:
-    """
-    Compute the execution-driven reputation score.
-
-    Args:
-        N_plus (int): Number of fulfilled (positive) contract units.
-        N_minus (int): Number of defaulted (negative) contract units.
-        w4 (float): Weight for positive executions.
-        w5 (float): Weight for negative executions.
-
-    Returns:
-        float: Reputation value: w4 * N_plus - w5 * N_minus.
-    """
+def reputation(N_plus, N_minus, w4=1.0, w5=1.0):
     return float(w4 * N_plus - w5 * N_minus)
 
 
-def reward(
-    action: int,
-    ESP_Utility: float,
-    MU_Utility: float,
-    Rep: float,
-    Rew1: float = -10.0,
-    omega6: float = 1e-3,
-    omega7: float = 1.0,
-) -> float:
-    """
-    Paper-style reward function for the renew/execute decision.
-
-    Policy:
-        - If action == 0 (renew):    r = Rew1
-        - If action == 1 (execute):  r = omega6 * (ESP_Utility + MU_Utility) + omega7 * Rep
-
-    Args:
-        action (int): 0 for renew, 1 for execute.
-        ESP_Utility (float): ESP utility realized in this step.
-        MU_Utility (float): MU utility realized in this step.
-        Rep (float): Reputation value from `reputation(...)`.
-        Rew1 (float): Base reward for renewing (typically negative).
-        omega6 (float): Weight for total utility.
-        omega7 (float): Weight for reputation.
-
-    Returns:
-        float: Scalar reward.
-    """
-    if action == 0:
-        return float(Rew1)
-    return float(omega6 * (ESP_Utility + MU_Utility) + omega7 * Rep)
+def reward(action, ESP_Utility, MU_Utility, Rep, Rew1=-10.0, omega6=1e-3, omega7=1.0):
+    if action not in (0, 1):
+        raise ValueError("action must be Renew=0 or Execute=1")
+    return float(Rew1 if action == 0 else omega6 * (ESP_Utility + MU_Utility) + omega7 * Rep)
 
 
-# ------------- DDQN Agent -------------
 class DQN(nn.Module):
-    """
-    A small MLP Q-network used by the DDQN agent.
-
-    Architecture:
-        input(state_size) -> 64 -> 64 -> output(action_size)
-
-    Notes:
-        - Forward returns a tensor of Q-values of shape (action_size,)
-          when a single state is provided, or (batch, action_size)
-          when a batch is provided.
-    """
-    def __init__(self, state_size: int, action_size: int):
+    def __init__(self, state_size, action_size):
         super().__init__()
         self.fc1 = nn.Linear(state_size, 64)
         self.fc2 = nn.Linear(64, 64)
         self.fc3 = nn.Linear(64, action_size)
 
     def forward(self, x):
-        """
-        Forward pass through the Q-network.
-
-        Args:
-            x (Tensor): State tensor with shape (state_size,) or (batch, state_size).
-
-        Returns:
-            Tensor: Q-values. Shape is (action_size,) for single state,
-                    or (batch, action_size) for batches.
-        """
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        q = self.fc3(x)
-        return q.squeeze(0) if q.shape[0] == 1 else q
+        # Preserve the batch axis even when batch size == 1.
+        return self.fc3(torch.relu(self.fc2(torch.relu(self.fc1(x)))))
 
 
 class DDQNAgent:
-    """
-    Minimal Double DQN agent for the renew/execute decision.
-
-    Key features:
-        - Experience replay buffer (FIFO with capacity).
-        - Epsilon-greedy exploration with exponential decay.
-        - Target network updated via hard copy (update_target()).
-        - Double-DQN target: greedy action from online network,
-          Q-value from target network.
-
-    Args:
-        state_size (int): Dimension of the environment state.
-        action_size (int): Number of discrete actions (2 in Oh-Trust).
-        capacity (int): Replay buffer capacity.
-    """
-    def __init__(self, state_size: int, action_size: int, capacity: int = 50000):
-        self.action_size = action_size
-        self.memory: List[tuple] = []
-        self.capacity = capacity
-
-        # RL hyperparameters
-        self.gamma = 0.95
-        self.epsilon = 1.0
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.995
-        self.batch_size = 64
-        self.lr = 1e-3
-
-        # Networks
-        self.model = DQN(state_size, action_size).to(DEVICE)
-        self.target = DQN(state_size, action_size).to(DEVICE)
-        self._sync()
-
-        # Optimizer & loss
+    def __init__(self, state_size=4, action_size=2, capacity=50000, *, seed=0,
+                 training=True, state_scale=None, batch_size=32, device="cpu",
+                 target_tau=0.05):
+        self.state_size, self.action_size = state_size, action_size
+        self.memory = deque(maxlen=capacity)
+        self.rng = np.random.default_rng(seed)
+        self.replay_rng = random.Random(seed)
+        self.device = torch.device(device)
+        self.training = training
+        self.gamma, self.epsilon, self.epsilon_min, self.epsilon_decay = 0.95, 1.0, 0.01, 0.995
+        self.batch_size, self.lr, self.target_tau = batch_size, 1e-3, target_tau
+        if not 0 < target_tau <= 1 or batch_size < 1:
+            raise ValueError("invalid training configuration")
+        self.state_scale = np.ones(state_size) if state_scale is None else np.asarray(state_scale, dtype=float)
+        if self.state_scale.shape != (state_size,) or not np.all(np.isfinite(self.state_scale)) or np.any(self.state_scale <= 0):
+            raise ValueError("state_scale must be finite and positive")
+        # Network initialization is independent of other agents' RNG consumption.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            self.model = DQN(state_size, action_size).to(self.device)
+            self.target = DQN(state_size, action_size).to(self.device)
+        self.update_target(tau=1.0)
+        self.target.requires_grad_(False)
+        self.target.eval()
+        self.model.train(training)
         self.crit = nn.MSELoss()
         self.opt = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.updates = 0
 
-    def _sync(self):
-        """Hard update: copy online network weights to target network."""
-        self.target.load_state_dict(self.model.state_dict())
+    def set_training(self, training):
+        self.training = bool(training)
+        self.model.train(self.training)
 
-    def remember(self, s, a, r, s2, d):
-        """
-        Append a transition to the replay buffer (FIFO if full).
+    def normalize(self, state):
+        x = np.asarray(state, dtype=np.float32)
+        if x.shape != (self.state_size,) or not np.all(np.isfinite(x)):
+            raise ValueError("invalid state")
+        x = x / self.state_scale
+        return (np.sign(x) * np.log1p(np.abs(x))).astype(np.float32)
 
-        Args:
-            s:    state (np.ndarray)
-            a:    action (int)
-            r:    reward (float)
-            s2:   next state (np.ndarray)
-            d:    done (bool)
-        """
-        if len(self.memory) >= self.capacity:
-            self.memory.pop(0)
-        self.memory.append((s, a, r, s2, d))
-
-    def act(self, state: np.ndarray) -> int:
-        """
-        Epsilon-greedy action selection.
-
-        Args:
-            state (np.ndarray): Current state.
-
-        Returns:
-            int: Chosen action index.
-        """
-        if np.random.rand() <= self.epsilon:
-            return int(np.random.randint(self.action_size))
+    def act(self, state, *, evaluate=None, valid_actions=(0, 1)):
+        actions = np.asarray(valid_actions, dtype=int)
+        if len(actions) == 0 or np.any(actions < 0) or np.any(actions >= self.action_size):
+            raise ValueError("invalid action mask")
+        explore = self.training if evaluate is None else not evaluate
+        if explore and self.rng.random() < self.epsilon:
+            return int(self.rng.choice(actions))
         with torch.no_grad():
-            s = torch.as_tensor(state, dtype=torch.float32, device=DEVICE)
-            q = self.model(s)
-            return int(torch.argmax(q).item())
+            q = self.model(torch.as_tensor(self.normalize(state), device=self.device)).cpu().numpy()
+        return int(actions[np.argmax(q[actions])])
+
+    def remember(self, s, a, r, s2, d, next_valid_actions=(0, 1)):
+        mask = np.zeros(self.action_size, dtype=bool)
+        mask[list(next_valid_actions)] = True
+        if not d and not mask.any():
+            raise ValueError("nonterminal state needs a valid next action")
+        self.memory.append((self.normalize(s), int(a), float(r), self.normalize(s2), bool(d), mask))
+
+    def bellman_targets(self, rewards, next_states, dones, masks):
+        with torch.no_grad():
+            # Terminal masks may be empty; bootstrap is removed below.
+            masks = masks.clone()
+            masks[dones] = True
+            q_online = self.model(next_states).masked_fill(~masks, -torch.inf)
+            actions = q_online.argmax(dim=1)
+            q_target = self.target(next_states).gather(1, actions[:, None]).squeeze(1)
+            return rewards + (~dones).float() * self.gamma * q_target
 
     def replay(self):
-        """
-        Sample a mini-batch and perform one DDQN update step.
-        If the buffer has fewer samples than batch_size, no update is performed.
-        """
-        if len(self.memory) < self.batch_size:
-            return
-        batch = random.sample(self.memory, self.batch_size)
-
-        states = torch.as_tensor([b[0] for b in batch], dtype=torch.float32, device=DEVICE)
-        actions = torch.as_tensor([b[1] for b in batch], dtype=torch.int64, device=DEVICE)
-        rewards = torch.as_tensor([b[2] for b in batch], dtype=torch.float32, device=DEVICE)
-        next_states = torch.as_tensor([b[3] for b in batch], dtype=torch.float32, device=DEVICE)
-        dones = torch.as_tensor([b[4] for b in batch], dtype=torch.bool, device=DEVICE)
-
-        # Q(s, a)
-        q = self.model(states)
-        q_sa = q.gather(1, actions.unsqueeze(1)).squeeze(1)
-
-        # Double DQN target: a*(s') from online, Q_target(s', a*)
-        with torch.no_grad():
-            q_next_online = self.model(next_states)
-            a_next = torch.argmax(q_next_online, dim=1)
-            q_next_target = self.target(next_states)
-            q_next = q_next_target.gather(1, a_next.unsqueeze(1)).squeeze(1)
-            target_sa = rewards + (~dones).float() * self.gamma * q_next
-
-        loss = self.crit(q_sa, target_sa)
+        if not self.training or len(self.memory) < self.batch_size:
+            return None
+        batch = self.replay_rng.sample(list(self.memory), self.batch_size)
+        def tensor(column, dtype):
+            return torch.as_tensor(np.stack([b[column] for b in batch]), dtype=dtype, device=self.device)
+        states, actions = tensor(0, torch.float32), tensor(1, torch.int64)
+        rewards, next_states = tensor(2, torch.float32), tensor(3, torch.float32)
+        dones, masks = tensor(4, torch.bool), tensor(5, torch.bool)
+        q_sa = self.model(states).gather(1, actions[:, None]).squeeze(1)
+        target = self.bellman_targets(rewards, next_states, dones, masks)
+        loss = self.crit(q_sa, target)
         self.opt.zero_grad()
         loss.backward()
+        nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
         self.opt.step()
-
-        # Epsilon decay
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-
-    def update_target(self):
-        """Synchronize target network with online network."""
-        self._sync()
-
-    def save(self, path: str):
-        """Save the online network weights to disk."""
-        torch.save(self.model.state_dict(), path)
-
-    def load(self, path: str):
-        """
-        Load weights from disk into the online network and
-        immediately synchronize the target network.
-        """
-        self.model.load_state_dict(torch.load(path, map_location=DEVICE))
         self.update_target()
+        self.updates += 1
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        return float(loss.detach().cpu())
+
+    def update_target(self, tau=None):
+        # Algorithm 3 line 17: theta_hat <- mu theta + (1-mu) theta_hat.
+        tau = self.target_tau if tau is None else tau
+        with torch.no_grad():
+            for target, online in zip(self.target.parameters(), self.model.parameters()):
+                target.mul_(1 - tau).add_(online, alpha=tau)
+
+    def save(self, path):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model": self.model.state_dict(), "state_scale": self.state_scale.tolist(),
+                    "state_size": self.state_size, "action_size": self.action_size,
+                    "format_version": 1}, path)
+
+    def load(self, path):
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
+        if ckpt["state_size"] != self.state_size or ckpt["action_size"] != self.action_size:
+            raise ValueError("checkpoint dimensions differ")
+        self.model.load_state_dict(ckpt["model"])
+        self.state_scale = np.asarray(ckpt["state_scale"], dtype=float)
+        self.update_target(tau=1.0)
