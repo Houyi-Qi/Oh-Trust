@@ -210,7 +210,7 @@ def binomial_probability(n, k, p):
 
 
 def U_F_i_expected(*args, **kwargs):
-    raise NotImplementedError("Unsafe legacy expectation removed; use evaluate_contract with joint scenarios")
+    raise NotImplementedError("Deprecated expectation interface; use evaluate_contract instead")
 
 
 def U_ESP_Expected(*args, **kwargs):

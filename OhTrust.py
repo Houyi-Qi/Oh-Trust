@@ -327,7 +327,7 @@ def compare(traces, config=None, *, seed=7, episodes=3, checkpoint=None, methods
         raise AssertionError("methods did not consume the identical demand trajectory")
     return to_builtin(dict(scope="MINIMAL_SYNTHETIC_DEMO" if traces["test"].label.startswith("synthetic")
                            else "LOCAL_DEMANDS_WITH_DEMO_VALUATIONS",
-                           scientific_evidence="SCIENTIFIC_EVIDENCE_INSUFFICIENT",
+                           evaluation_scope="demonstration_only",
                            seed=seed, config=asdict(cfg), shared_trajectory_verified=shared,
                            traces={name: {"hash": tr.digest, "source": tr.label,
                                            "transactions": len(tr.demands),
@@ -368,7 +368,7 @@ def cli_main(default_method="OhTrust"):
                      checkpoint=args.model, methods=methods)
     path.write_text(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
     print(json.dumps(result["summaries"], indent=2, ensure_ascii=False, allow_nan=False))
-    print(f"Shared trajectory: PASS. Saved: {path}. Scientific performance: NOT_VALIDATED.")
+    print(f"Comparison completed. Results saved to {path}.")
 
 
 

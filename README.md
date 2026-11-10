@@ -114,10 +114,9 @@ Results are saved to `results/compare.json` by default; use `--output` to change
 
 ## 📝 Notes
 
-- Updates unify settlement and probability estimation, fix residual demand allocation, history leakage, and DDQN renewal, and give all baselines the same demand traces and metrics.
+- The implementation provides unified settlement, probability estimation, and contract renewal procedures. It supports synthetic demonstrations and reproducible comparisons under shared demand traces.
 - Risks use historical samples. Task-level settlement separates buyer default penalties from volunteer compensation. These adapt the paper's mechanisms; large contract spaces use a heuristic search.
 - Defaults are `tau = 0.1` and `0.3` for all three risk thresholds. Synthetic capacity, valuations, and other demo parameters do not represent the paper's experimental configuration.
-- Original filenames and command-line entry points are retained. Some internal APIs now require explicit demand, capacity, or related inputs.
 - This release supports checking core mechanisms; it does not reproduce all paper figures or establish a performance advantage.
 
 ---
